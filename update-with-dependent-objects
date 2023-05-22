@@ -1,0 +1,355 @@
+#!/usr/bin/env python3
+import argparse
+import sys
+import re
+import subprocess
+from typing import List, Optional
+from pathlib import Path
+import json
+from io import StringIO
+import tempfile
+
+depends_re = re.compile(r'.*?(materialized view|view) ["]?([^"]+)["]?\.["]?([^"]+)["]? depends on ([a-z ]+) ["]?([^"]+)["]?(\.["]?([^"]+)["]?)?')
+statement_re = re.compile(r'.* STATEMENT:\s+(.*)')
+drop_statement_re = re.compile(r'.* cannot (drop.*) because other objects depend on it')
+
+
+class bcolors:
+    HEADER = '\033[95m'
+    OKBLUE = '\033[94m'
+    OKCYAN = '\033[96m'
+    OKGREEN = '\033[92m'
+    WARNING = '\033[93m'
+    FAIL = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+
+
+class QueryContext:
+    statement: str
+    dependees: List[str]
+    dependents: List[str]
+
+    def __init__(self, statement: str, dependees: List[str], dependents: List[str]):
+        self.statement = statement
+        self.dependees = dependees
+        self.dependents = dependents
+
+    def to_dict(self):
+        return {
+            "statement": self.statement,
+            "dependees": [d.to_dict() for d in self.dependees],
+            "dependents": [d.to_dict() for d in self.dependents],
+        }
+
+
+def main():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        '--input-is-query', action='store_true', default=False,
+        help='execute the input as a query'
+    )
+
+    parser.add_argument(
+        '--multi-action-input', action='store_true', default=False,
+        help='process each line from the input as a separate change'
+    )
+
+    parser.add_argument(
+        '--spec', type=Path,
+        help='use json spec for actions'
+    )
+
+    parser.add_argument(
+        '--tmp-sql-path', type=Path, default=Path("/tmp", "update.sql"),
+        help='use json spec for actions'
+    )
+
+    parser.add_argument(
+        'infile', nargs='?', type=argparse.FileType('r'), default=sys.stdin
+    )
+
+    args = parser.parse_args()
+
+
+    if args.spec:
+        query_context = load_context(args.spec)
+        process(args.spec, args.tmp_sql_path, query_context)
+    else:
+        spec_path = Path("/tmp", "spec.json")
+
+        if args.input_is_query:
+            lines = args.infile.read()
+            query_context = QueryContext(lines, [], [])
+            process(spec_path, args.tmp_sql_path, query_context)
+        else:
+            if args.multi_action_input:
+                lines = args.infile.readlines()
+
+                for line in lines:
+                    query_context = QueryContext(line, [], [])
+                    process(spec_path, args.tmp_sql_path, query_context)
+            else:
+                lines = args.infile.read()
+                query_context = QueryContext(lines, [], [])
+                process(spec_path, args.tmp_sql_path, query_context)
+
+
+def process(spec_path: Path, tmp_sql_path: Path, query_context: QueryContext):
+    retry = True
+
+    while retry:
+        with tmp_sql_path.open("w") as tempfile:
+            generate_update_script(query_context, tempfile)
+
+        result = execute_sql_script(tmp_sql_path)
+
+        if result:
+            ds = dependents_from_error(result)
+
+            if len(ds) == 0:
+                print("Executing SQL failed due to unexpected error:")
+
+                print(bcolors.FAIL)
+                for line in result.split("\n"):
+                    sys.stdout.write("  {}".format(line))
+                print(bcolors.ENDC)
+
+                sys.exit(3)
+            else:
+                print("Executing SQL failed due to additional dependent objects")
+
+            for d in ds:
+                print(" {}+ {}{}".format(bcolors.OKCYAN, d, bcolors.ENDC))
+                # Check if the dependent object was registered earlier. If so, remove it from the earlier position
+                for cd in query_context.dependents:
+                    if d == cd:
+                        print("Removing earlier occurrence")
+                        query_context.dependents.remove(d)
+
+            query_context.dependents.extend(ds)
+            write_context(spec_path, query_context)
+        else:
+            retry = False
+
+            print("Executed SQL successfully:")
+
+            print(bcolors.OKGREEN)
+
+            for line in query_context.statement.split("\n"):
+                sys.stdout.write("  {}".format(line))
+
+            print(bcolors.ENDC)
+            print()
+
+
+def generate_update_script(query_context, out_file):
+    drop_dependents_path = 'drop_dependents.sql'
+    original_statement_path = 'original_statement.sql'
+    restore_script_path = 'restore_script.sql'
+
+    out_file.write('BEGIN;\n')
+
+    for dependent in query_context.dependents[::-1]:
+        drop_statement = f'DROP {dependent.object_type} "{dependent.schema}"."{dependent.name}";\n'
+        out_file.write(drop_statement)
+
+    out_file.write('\n')
+
+    if query_context.statement is None:
+        out_file.write('--------------------------------------------\n')
+        out_file.write('-- Place the schema altering statements here\n')
+        out_file.write('--------------------------------------------\n')
+    else:
+        out_file.write('-----------------------------------------------------------\n')
+        out_file.write('-- Check if this is the only schema alteration required,\n')
+        out_file.write('-- and otherwise add additional schema altering statements.\n')
+        out_file.write('-----------------------------------------------------------\n')
+        out_file.write(query_context.statement)
+
+    out_file.write(';\n')
+    out_file.write('\n')
+
+    if query_context.dependents:
+        pg_dump_cmd = generate_pg_dump_cmd(query_context.dependents)
+
+        out_file.write('-- Generated by command: {}\n\n'.format(' '.join(pg_dump_cmd)))
+
+        print("Extracting dependent object definitions...")
+
+        restore_sql = run_pg_dump_cmd(pg_dump_cmd)
+
+        if len(restore_sql) < 10:
+            raise Exception("pg_dump output too small:\n{}".format(restore_sql))
+
+        out_file.write(restore_sql)
+
+    out_file.write('COMMIT;\n')
+
+
+def load_context(path: Path) -> QueryContext:
+    with path.open() as infile:
+        data = json.load(infile)
+
+    statement = data["statement"]
+    dependees = [Dependee.from_dict(d) for d in data["dependees"]]
+    dependents = [Dependent.from_dict(d) for d in data["dependents"]]
+
+    return QueryContext(statement, dependees, dependents)
+
+
+def write_context(path: Path, query_context: QueryContext):
+    data = query_context.to_dict()
+
+    with path.open("w") as outfile:
+        json.dump(data, outfile, indent=4)
+
+
+def execute_query(query: str) -> str:
+    execute_query_cmd = ['psql', '-c', query]
+
+    result = subprocess.run(execute_query_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    return result.stderr.decode('utf-8')
+
+
+def execute_sql_script(script: Path) -> Optional[str]:
+    execute_query_cmd = ['psql', '-v', "ON_ERROR_STOP=1", '-f', str(script)]
+
+    print("Executing SQL")
+
+    result = subprocess.run(execute_query_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    if result.returncode != 0:
+        return result.stderr.decode('utf-8')
+
+    return None
+
+
+def dependents_from_error(error_text: str):
+    dependents = []
+
+    for line in error_text.split("\n"):
+        m = depends_re.match(line)
+
+        if m is not None:
+            dependent_object_type = m.groups()[0]
+            dependent_schema = m.groups()[1]
+            dependent_name = m.groups()[2]
+
+            dependent = Dependent(dependent_object_type, dependent_schema, dependent_name)
+            dependents.append(dependent)
+
+    return dependents
+
+
+def query_context_from_error(lines) -> QueryContext:
+    statement = None
+    dependees = []
+    dependents = []
+
+    for line in lines:
+        m = depends_re.match(line)
+
+        if m is not None:
+            dependent_object_type = m.groups()[0]
+            dependent_schema = m.groups()[1]
+            dependent_name = m.groups()[2]
+
+            dependent = Dependent(dependent_object_type, dependent_schema, dependent_name)
+            dependents.append(dependent)
+
+            dependee_object_type = m.groups()[3]
+            dependee_schema = m.groups()[4]
+            dependee_name = m.groups()[5]
+    
+            dependee = Dependee(dependee_object_type, dependee_schema, dependee_name)
+            dependees.append(dependee)
+            #print(f"{dependent_object_type} {dependent_schema}.{dependent_name} depends on {dependee_object_type} {dependee_schema}.{dependee_name}") 
+
+        m = statement_re.match(line)
+
+        if m is not None:
+            statement = m.groups()[0]
+        else:
+            m = drop_statement_re.match(line)
+
+            if m is not None:
+                statement = m.groups()[0]
+
+    return QueryContext(statement, dependees, dependents)
+
+
+def generate_pg_dump_cmd(dependents):
+    pg_dump_cmd = [
+        'pg_dump',
+        '--schema-only',
+    ]
+
+    for dependent in dependents:
+        reference = f'"{dependent.schema}"."{dependent.name}"'
+        pg_dump_cmd.append('-t')
+        pg_dump_cmd.append(reference)
+
+    return pg_dump_cmd
+
+
+def run_pg_dump_cmd(pg_dump_cmd):
+    result = subprocess.run(pg_dump_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    if result.returncode != 0:
+        err = result.stderr.decode('utf-8')
+        raise Exception("Error running pg_dump: {}".format(err))
+
+    return result.stdout.decode('utf-8')
+
+
+class Dependent:
+    def __init__(self, object_type, schema, name):
+        self.object_type = object_type
+        self.schema = schema
+        self.name = name
+
+    def __eq__(self, other):
+        return self.object_type == other.object_type and self.schema == other.schema and self.name == other.name
+
+    @staticmethod
+    def from_dict(data: dict):
+        return Dependent(data["object_type"], data["schema"], data["name"])
+
+    def to_dict(self):
+        return {
+            "object_type": self.object_type,
+            "schema": self.schema,
+            "name": self.name
+        }
+
+    def __str__(self):
+        return f"{self.object_type} {self.schema}.{self.name}"
+
+
+class Dependee:
+    def __init__(self, object_type, schema, name):
+        self.object_type = object_type
+        self.schema = schema
+        self.name = name
+
+    @staticmethod
+    def from_dict(data: dict):
+        return Dependee(data["object_type"], data["schema"], data["name"])
+
+    def to_dict(self):
+        return {
+            "object_type": self.object_type,
+            "schema": self.schema,
+            "name": self.name
+        }
+
+    def __str__(self):
+        return f"{self.object_type} {self.schema}.{self.name}"
+
+
+if __name__ == '__main__':
+    main()
